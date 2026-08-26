@@ -29,7 +29,7 @@ const BASE = { lat: 35.17955, lng: 129.07564 }
 const localIso = (date = new Date()) =>
   new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 19)
 
-// api-spec 5-D의 좌표 한 개
+// api-spec 5-D의 좌표 한 개 — 단말이 모두 측정한 정상 배치
 const samplePoint = (seq) => ({
   sequence: seq,
   latitude: Number((BASE.lat + seq * 0.00002).toFixed(7)),
@@ -40,6 +40,16 @@ const samplePoint = (seq) => ({
   headingDegrees: 0,
   cadenceSpm: 165,
   currentPaceSecondsPerKm: 345,
+  recordedAt: localIso(new Date(Date.now() + seq * 1000)),
+})
+
+// 단말이 못 재는 값을 뺀 좌표 — Location.isValid()가 요구하는 것만 담았다.
+// 케이던스는 보수 센서가 있어야 하고, 속도·방위는 GPS 초기 픽스나 정지 상태에서 안 온다
+const partialPoint = (seq) => ({
+  sequence: seq,
+  latitude: Number((BASE.lat + seq * 0.00002).toFixed(7)),
+  longitude: BASE.lng,
+  accuracyMeters: 6.2,
   recordedAt: localIso(new Date(Date.now() + seq * 1000)),
 })
 
@@ -87,7 +97,8 @@ export default function App() {
     log('info', `로그인 성공 — userId=${body.userId}`)
   }
 
-  // 방을 먼저 만들어야 RUNNING_START에 실을 runningRoomId가 생긴다
+  // 방을 먼저 만들어야 RUNNING_START에 실을 runningRoomId가 생긴다.
+  // 좌표 전송에는 더 이상 필요 없다 — 서버가 세션에 들고 있다
   async function openSoloRoom() {
     if (!token) return log('error', '먼저 로그인하세요')
     const { ok, status, body } = await api('/api/v1/running-rooms/solo', { method: 'POST' })
@@ -130,7 +141,8 @@ export default function App() {
 
   const runningStart = (data) => `{"event":"RUNNING_START","data":${data}}`
 
-  // 재연결·재입장·최초 진입 모두 같은 메시지 — 두 번 보내도 상태가 안 바뀌어야 한다
+  // 재연결·재입장·최초 진입 모두 같은 메시지 — 두 번 보내도 상태가 안 바뀌어야 한다.
+  // 이 메시지만이 방을 정한다. 성공하면 서버가 세션에 runningRoomId를 새긴다
   function sendStart(slot) {
     if (!roomId) return log('error', '먼저 솔로 방을 개시하거나 roomId를 입력하세요', slot)
     send(slot, runningStart(`{"runningRoomId":${roomId}}`))
@@ -158,14 +170,19 @@ export default function App() {
   }
 
   // ── 위치 전송 ──────────────────────────────────────────────
-  // 성공해도 ack가 없다(api-spec 5-D) — 화면은 조용하고 확인은 redis-cli로 한다
+  // 성공해도 ack가 없다(api-spec 5-D) — 화면은 조용하고 확인은 redis-cli로 한다.
+  // runningRoomId는 싣지 않는다 — RUNNING_START가 정한 방을 서버가 세션에 들고 있다
 
   function sendLocations(slot, locations) {
-    if (!roomId) return log('error', '먼저 솔로 방을 개시하세요', slot)
     send(slot, JSON.stringify({
       event: 'RUNNING_LOCATION_UPDATE',
-      data: { runningRoomId: Number(roomId), locations },
+      data: { locations },
     }))
+  }
+
+  // data를 손대지 않고 그대로 보낸다 — 서버가 안 읽는 필드를 일부러 끼워 넣을 때 쓴다
+  function sendLocationsRaw(slot, data) {
+    send(slot, JSON.stringify({ event: 'RUNNING_LOCATION_UPDATE', data }))
   }
 
   // 클라는 1~2초 간격으로 모아 10초마다 보낸다 — 배치 하나에 5개
@@ -211,6 +228,32 @@ export default function App() {
     setTrackSize(0)
   }
 
+  // ── 방 위조 ────────────────────────────────────────────────
+  // 서버는 클라가 보낸 runningRoomId를 읽지 않는다.
+  // RUNNING_START가 참가자 검증을 마치고 세션에 새긴 값만 저장 키로 쓴다
+
+  // 서버가 안 읽는 필드를 일부러 실어 보낸다 — 무시되고 내 방에 정상 저장돼야 한다.
+  // 구버전 앱이 계속 보내도 안 깨진다는 확인이기도 하다
+  function sendIgnoredRoomId(slot) {
+    sendLocationsRaw(slot, {
+      runningRoomId: 999999,
+      locations: [samplePoint(sequence.current)],
+    })
+  }
+
+  // RUNNING_START를 보내지 않은 소켓으로 좌표를 보낸다 — 서버에 정해진 방이 없다.
+  // 연결만으로는 아무것도 등록되지 않으므로(핸들러 afterConnectionEstablished)
+  // B를 연결해도 A가 4001로 끊기지 않는다
+  function sendWithoutStart(slot) {
+    sendLocationsRaw(slot, { locations: [samplePoint(sequence.current)] })
+  }
+
+  // ⚠️ 알려진 서버 버그 — Location.isValid()는 통과하지만 TrackPoint가 원시 타입이라
+  // 언박싱 NPE가 난다. ERROR도 안 오고 이 배치가 통째로 사라진다
+  function sendPartialPoint(slot) {
+    sendLocations(slot, [partialPoint(sequence.current)])
+  }
+
   const color = { sent: '#0b6', recv: '#06c', error: '#c33', info: '#666' }
   const row = { marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }
   const divider = { ...row, borderTop: '1px solid #ddd', paddingTop: 10 }
@@ -231,6 +274,7 @@ export default function App() {
         <button onClick={openSoloRoom} disabled={!token}>솔로 방 개시 (POST /running-rooms/solo)</button>
         <input placeholder="runningRoomId" value={roomId} style={{ width: 120 }}
                onChange={(e) => setRoomId(e.target.value)} />
+        <span style={{ color: '#666' }}>← RUNNING_START에만 쓴다</span>
       </section>
 
       {['A', 'B'].map((slot) => (
@@ -264,6 +308,17 @@ export default function App() {
         <span>보낸 좌표 {trackSize}개</span>
       </section>
 
+      {/* 서버가 클라의 roomId를 안 읽는지 확인한다 */}
+      <section style={divider}>
+        <strong style={{ width: 84 }}>방 위조</strong>
+        <button onClick={() => sendIgnoredRoomId('A')} disabled={!open.A}>
+          roomId 999999 끼워넣기 → 무시되고 내 방에 저장
+        </button>
+        <button onClick={() => sendWithoutStart('B')} disabled={!open.B}>
+          B: START 없이 좌표 → RUNNING_NOT_STARTED
+        </button>
+      </section>
+
       <section style={divider}>
         <strong style={{ width: 84 }}>위치 실패</strong>
         <button onClick={() => sendLocations('A', [])} disabled={!open.A}>
@@ -280,6 +335,10 @@ export default function App() {
         <button onClick={() => sendLocations('A', [{ ...samplePoint(0), sequence: null }])}
                 disabled={!open.A}>
           순번 없음 → INVALID_REQUEST
+        </button>
+        <button onClick={() => sendPartialPoint('A')} disabled={!open.A}
+                style={{ borderColor: '#c33', color: '#c33' }}>
+          ⚠️ 선택 필드 누락 → 응답 없이 유실 (서버 NPE)
         </button>
       </section>
 
