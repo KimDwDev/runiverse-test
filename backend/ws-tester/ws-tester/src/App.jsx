@@ -22,8 +22,17 @@ const CLOSE_REASON = {
   4001: '다른 연결이 이어받음 (중복 연결)',
 }
 
-// 부산 어딘가 — 순번이 늘수록 북쪽으로 약 2m씩 이동시킨다
+// 부산 어딘가 — 순번이 늘수록 북쪽으로 약 2.2m씩 이동시킨다
 const BASE = { lat: 35.17955, lng: 129.07564 }
+
+// 좌표 하나가 만드는 거리·시간. running-finish.min-distance-meters(100m)와
+// min-duration-seconds(60s)를 둘 다 넘겨야 기록이 생긴다 — 아래 RECORDABLE_POINTS의 근거다
+const METERS_PER_STEP = 2.22
+const RECORDABLE_POINTS = 120          // 약 264m · 119초
+// websocket.max-text-message-buffer-size=16KB — 한 메시지에 다 담으면 서버가 끊는다
+const CHUNK_SIZE = 40
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // 서버가 LocalDateTime으로 받으므로 UTC(toISOString)가 아니라 로컬 시각이어야 한다
 const localIso = (date = new Date()) =>
@@ -98,15 +107,17 @@ export default function App() {
   }
 
   // 방을 먼저 만들어야 RUNNING_START에 실을 runningRoomId가 생긴다.
-  // 좌표 전송에는 더 이상 필요 없다 — 서버가 세션에 들고 있다
+  // 좌표·종료 전송에는 더 이상 필요 없다 — 서버가 세션에 들고 있다.
+  // setState는 비동기라 전체 시나리오가 쓸 수 있게 id를 반환한다
   async function openSoloRoom() {
-    if (!token) return log('error', '먼저 로그인하세요')
+    if (!token) { log('error', '먼저 로그인하세요'); return null }
     const { ok, status, body } = await api('/api/v1/running-rooms/solo', { method: 'POST' })
-    if (!ok) return log('error', `솔로 방 개시 실패 ${status} — ${JSON.stringify(body)}`)
+    if (!ok) { log('error', `솔로 방 개시 실패 ${status} — ${JSON.stringify(body)}`); return null }
     setRoomId(String(body.runningRoomId))
     resetSequence()   // 방이 바뀌면 순번도 처음부터다
     // 이 시점 방은 MATCHED, 참가자는 JOINED다 — STARTED로 올리는 건 RUNNING_START다
     log('info', `솔로 방 개시 — runningRoomId=${body.runningRoomId} (MATCHED/JOINED)`)
+    return body.runningRoomId
   }
 
   function connect(slot) {
@@ -140,12 +151,13 @@ export default function App() {
   }
 
   const runningStart = (data) => `{"event":"RUNNING_START","data":${data}}`
+  const runningFinish = (data) => `{"event":"RUNNING_FINISH","data":${data}}`
 
   // 재연결·재입장·최초 진입 모두 같은 메시지 — 두 번 보내도 상태가 안 바뀌어야 한다.
   // 이 메시지만이 방을 정한다. 성공하면 서버가 세션에 runningRoomId를 새긴다
-  function sendStart(slot) {
-    if (!roomId) return log('error', '먼저 솔로 방을 개시하거나 roomId를 입력하세요', slot)
-    send(slot, runningStart(`{"runningRoomId":${roomId}}`))
+  function sendStart(slot, id = roomId) {
+    if (!id) return log('error', '먼저 솔로 방을 개시하거나 roomId를 입력하세요', slot)
+    send(slot, runningStart(`{"runningRoomId":${id}}`))
   }
 
   function sendStartTwice(slot) {
@@ -198,16 +210,32 @@ export default function App() {
     sendLocations(slot, batch)
   }
 
+  // 기록이 남는 러닝을 만든다 — 100m·60초를 못 넘기면 종료해도
+  // "기록 없이 상태만 확정"으로 끝나 running_records가 비어 있다(feature-spec §2)
+  async function sendRecordableTrack(slot, total = RECORDABLE_POINTS) {
+    for (let sent = 0; sent < total; sent += CHUNK_SIZE) {
+      sendNextBatch(slot, Math.min(CHUNK_SIZE, total - sent))
+      await sleep(200)   // 버퍼(16KB)를 넘기지 않으려고 나눠 보낸다
+    }
+    const meters = Math.round(allPoints.current.length * METERS_PER_STEP)
+    log('info', `기록 가능한 트랙 — 좌표 ${allPoints.current.length}개 ≈ ${meters}m`, slot)
+  }
+
   // 직전 배치를 그대로 다시 — 전부 중복이라 Redis에 아무것도 안 쌓여야 한다
   function resendLastBatch(slot) {
     if (!lastBatch.current.length) return log('error', '먼저 배치를 보내세요', slot)
     sendLocations(slot, lastBatch.current)
   }
 
-  // 재연결 시나리오 — 클라가 처음 sequence부터 전부 다시 보낸다(api-spec 5-D)
-  function resendAll(slot) {
+  // 재연결 시나리오 — 클라가 처음 sequence부터 전부 다시 보낸다(api-spec 5-D).
+  // 트랙이 길면 버퍼를 넘기므로 나눠 보낸다
+  async function resendAll(slot) {
     if (!allPoints.current.length) return log('error', '먼저 배치를 보내세요', slot)
-    sendLocations(slot, allPoints.current)
+    const points = allPoints.current
+    for (let i = 0; i < points.length; i += CHUNK_SIZE) {
+      sendLocations(slot, points.slice(i, i + CHUNK_SIZE))
+      await sleep(200)
+    }
   }
 
   function toggleAutoLocation(slot) {
@@ -226,6 +254,43 @@ export default function App() {
     lastBatch.current = []
     allPoints.current = []
     setTrackSize(0)
+  }
+
+  // ── 러닝 종료 ──────────────────────────────────────────────
+  // 상태가 걸린 요청이라 ack가 있다 — RUNNING_FINISHED를 받으면 클라는 로컬 트랙을 지운다.
+  // forced는 조기 종료 '의사'일 뿐, 최종 상태는 서버가 확정한 거리로 정해진다
+
+  function sendFinish(slot, forced = false) {
+    send(slot, runningFinish(`{"forced":${forced}}`))
+  }
+
+  // 서버가 안 읽는 필드 — 세션이 기억한 방이 끝나고 999999는 무시된다
+  function sendFinishWithFakeRoom(slot) {
+    send(slot, runningFinish('{"runningRoomId":999999,"forced":false}'))
+  }
+
+  // 종료를 두 번 — 두 번째도 RUNNING_FINISHED가 와야 한다.
+  // 기록을 덮어쓰지 않고 트랙만 정리하는 멱등 경로다(api-spec 5-D)
+  async function sendFinishTwice(slot) {
+    sendFinish(slot)
+    await sleep(500)
+    sendFinish(slot)
+  }
+
+  // ── 전체 시나리오 ──────────────────────────────────────────
+  // 방 개시 → 시작 → 기록 가능한 트랙 → 종료까지 한 번에.
+  // 소켓 A가 이미 연결돼 있어야 한다(연결은 토큰이 필요해 수동으로 둔다)
+  async function runFullScenario() {
+    if (!open.A) return log('error', '먼저 소켓 A를 연결하세요', 'A')
+    log('info', '=== 전체 시나리오 시작 ===')
+    const id = await openSoloRoom()
+    if (!id) return
+    sendStart('A', id)
+    await sleep(500)                    // RUNNING_STARTED를 받고 나서 좌표를 보낸다
+    await sendRecordableTrack('A')
+    await sleep(500)
+    sendFinish('A')
+    log('info', '=== RUNNING_FINISHED가 오면 성공 — running_records/running_splits 확인 ===')
   }
 
   // ── 방 위조 ────────────────────────────────────────────────
@@ -260,7 +325,7 @@ export default function App() {
 
   return (
     <div style={{ fontFamily: 'monospace', padding: 24, maxWidth: 1000 }}>
-      <h2>러닝 WebSocket 테스터 — RUNNING_START · LOCATION_UPDATE</h2>
+      <h2>러닝 WebSocket 테스터 — START · LOCATION_UPDATE · FINISH</h2>
 
       <section style={row}>
         <input placeholder="email" value={email} onChange={(e) => setEmail(e.target.value)} />
@@ -290,10 +355,26 @@ export default function App() {
         </section>
       ))}
 
+      {/* 개시부터 종료까지 — 기록이 실제로 만들어지는 유일한 경로 */}
+      <section style={divider}>
+        <strong style={{ width: 84 }}>전체 흐름</strong>
+        <button onClick={runFullScenario} disabled={!open.A}
+                style={{ fontWeight: 'bold' }}>
+          ▶ 개시 → START → 트랙 {RECORDABLE_POINTS}개 → FINISH
+        </button>
+        <span style={{ color: '#666' }}>
+          약 {Math.round(RECORDABLE_POINTS * METERS_PER_STEP)}m · {RECORDABLE_POINTS - 1}초 —
+          100m/60초를 넘겨야 기록이 남는다
+        </span>
+      </section>
+
       <section style={divider}>
         <strong style={{ width: 84 }}>위치 전송</strong>
         <button onClick={() => sendNextBatch('A')} disabled={!open.A}>
           배치 전송 (5개)
+        </button>
+        <button onClick={() => sendRecordableTrack('A')} disabled={!open.A}>
+          기록 가능한 트랙 ({RECORDABLE_POINTS}개)
         </button>
         <button onClick={() => resendLastBatch('A')} disabled={!open.A}>
           직전 배치 재전송 → 0개 적재
@@ -306,6 +387,36 @@ export default function App() {
         </button>
         <button onClick={resetSequence}>순번 초기화</button>
         <span>보낸 좌표 {trackSize}개</span>
+      </section>
+
+      {/* 종료 — ack가 오는 두 메시지 중 하나다 */}
+      <section style={divider}>
+        <strong style={{ width: 84 }}>러닝 종료</strong>
+        <button onClick={() => sendFinish('A')} disabled={!open.A}>
+          RUNNING_FINISH → RUNNING_FINISHED
+        </button>
+        <button onClick={() => sendFinish('A', true)} disabled={!open.A}>
+          forced:true (조기 종료)
+        </button>
+        <button onClick={() => sendFinishTwice('A')} disabled={!open.A}>
+          종료 ×2 (멱등 — 두 번째도 ack)
+        </button>
+        <button onClick={() => sendFinishWithFakeRoom('A')} disabled={!open.A}>
+          roomId 999999 끼워넣기 → 무시
+        </button>
+      </section>
+
+      <section style={divider}>
+        <strong style={{ width: 84 }}>종료 실패</strong>
+        <button onClick={() => send('A', runningFinish('{}'))} disabled={!open.A}>
+          forced 없음 → INVALID_REQUEST
+        </button>
+        <button onClick={() => sendFinish('B')} disabled={!open.B}>
+          B: START 없이 종료 → RUNNING_NOT_STARTED
+        </button>
+        <button onClick={() => sendStart('A')} disabled={!open.A}>
+          종료한 방에 다시 START → INVALID_ROOM_STATE
+        </button>
       </section>
 
       {/* 서버가 클라의 roomId를 안 읽는지 확인한다 */}
