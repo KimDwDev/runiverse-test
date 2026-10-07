@@ -1,13 +1,31 @@
 import { useEffect, useRef, useState } from 'react'
 
 const API = '/api/v1'
-const ORIGIN_LAT = 35.17955
-const ORIGIN_LNG = 129.07564
+// 강남역 — 좌표를 미는 쪽(gps_5556.sh)의 LAT0/LNG0과 같아야 한다
+const ORIGIN_LAT = 37.4979
+const ORIGIN_LNG = 127.0276
 const METERS_PER_DEGREE = 111_320
 const BATCH_SECONDS = 10         // 서버 tick(10s)과 맞춘다
 const DISTANCES = [3000, 5000, 10000]
 const SLOT_MINUTES = 5           // ApplyMatchRequest.SLOT_MINUTES와 맞춘다
 const CLOSE_OFFSET_MIN = 10      // match.close-offset — 이보다 가까운 슬롯은 서버가 거절한다
+
+// 상대는 3.0m/s(333s/km) 고정이다. 붙어 가되 발은 맞지 않게 흔든다 —
+// 간격은 base*RATIO*PERIOD/2π ≈ 5m만 오가서 콤보 판정 30m 안에 남는다.
+const WOBBLE_RATIO = 0.12        // 기준 속도의 ±12% (페이스로는 297~378s/km)
+const WOBBLE_PERIOD = 90         // 초
+// 상대가 먼저 출발해 앞서 있는 만큼. 여기서 출발해야 옆에 붙는다 —
+// 0에서 시작하면 그 차이가 그대로 간격이 되어 콤보가 안 붙는다.
+// 서버는 점과 점 사이 거리를 더하므로 첫 점을 앞에 찍어도 기록 거리는 0부터다
+const START_OFFSET_METERS = 600
+
+// 서버 websocket.idle-timeout이 2분이다 — 좌표 배치가 멎는 구간(완주 뒤, 탭이
+// 백그라운드로 밀려 타이머가 늦춰질 때)을 HEALTH_CHECK로 메운다
+const HEARTBEAT_MS = 30_000
+const RETRY_MS = 2_000           // 2·4·8… 초로 늘려 가며 다시 붙는다
+const MAX_RETRY = 6
+// 서버가 "다른 연결이 이어받았다"며 닫는 코드. 다시 붙으면 둘이 서로 밀어내며 돈다
+const SUPERSEDED = 4001
 
 // 서버가 LocalDateTime으로 받는다 — 타임존·밀리초를 빼야 한다
 const localIso = (d) =>
@@ -39,17 +57,27 @@ function Runner({ label }) {
   const [time, setTime] = useState(localIso(initial).slice(11, 16))
   const [distance, setDistance] = useState(5000)
   const [roomId, setRoomId] = useState('')
-  const [pace, setPace] = useState(330)
+  const [pace, setPace] = useState(333)      // 3.003m/s — 상대의 3.0과 미세하게 다르다
   const [running, setRunning] = useState(false)
   const [peers, setPeers] = useState([])
   const [logs, setLogs] = useState([])
 
   const ws = useRef(null)
   const abort = useRef(null)
+  const beat = useRef(null)                  // HEALTH_CHECK 타이머
+  const retry = useRef(0)
+  const closing = useRef(false)              // 우리가 의도해서 닫는 중인가
   const seq = useRef(0)
-  const meters = useRef(0)
+  const meters = useRef(START_OFFSET_METERS)
   const paceRef = useRef(pace)
   useEffect(() => { paceRef.current = pace }, [pace])
+
+  // 화면을 벗어날 때 타이머와 소켓을 남기지 않는다
+  useEffect(() => () => {
+    clearInterval(beat.current)
+    closing.current = true
+    ws.current?.close()
+  }, [])
 
   const log = (line) =>
     setLogs((p) => [`${new Date().toLocaleTimeString()} ${line}`, ...p].slice(0, 60))
@@ -148,23 +176,60 @@ function Runner({ label }) {
   }
 
   // ---------- WebSocket ----------
+  // 재연결 중에는 소켓이 닫혀 있다 — 그대로 부르면 InvalidStateError가 난다
+  const sendWs = (payload) => {
+    const socket = ws.current
+    if (socket?.readyState !== WebSocket.OPEN) return false
+    socket.send(JSON.stringify(payload))
+    return true
+  }
+
   const connect = () => {
+    closing.current = false
     // 브라우저는 헤더를 못 붙인다 — vite 프록시가 이 토큰을 Authorization으로 바꿔 전달한다
     const socket = new WebSocket(
       `ws://${location.host}${API}/ws/running?token=${auth.accessToken}`)
     ws.current = socket
-    socket.onopen = () => socket.send(JSON.stringify({
-      event: 'RUNNING_START', data: { runningRoomId: Number(roomId) },
-    }))
+
+    socket.onopen = () => {
+      retry.current = 0
+      // 재연결이어도 똑같이 보낸다 — 서버가 같은 방에 다시 붙여 준다
+      socket.send(JSON.stringify({
+        event: 'RUNNING_START', data: { runningRoomId: Number(roomId) },
+      }))
+      clearInterval(beat.current)
+      beat.current = setInterval(() => {
+        sendWs({ event: 'HEALTH_CHECK', data: {} })
+      }, HEARTBEAT_MS)
+    }
+
     socket.onmessage = (m) => {
       const { event, data } = JSON.parse(m.data)
+      if (event === 'HEALTH_CHECKED') return          // 하트비트 응답 — 로그를 덮지 않는다
       if (event === 'RUNNING_COMBO_UPDATED') return setPeers(data.peers)
       if (event === 'RUNNING_PROGRESS_UPDATED') return
       log(`WS ${event} ${JSON.stringify(data)}`)
       if (event === 'RUNNING_STARTED') { setRunning(true); abort.current?.abort() }
-      if (event === 'RUNNING_FINISHED') setRunning(false)
+      // 완주했으면 더 붙을 이유가 없다
+      if (event === 'RUNNING_FINISHED') { closing.current = true; setRunning(false) }
     }
-    socket.onclose = (e) => { setRunning(false); log(`WS 종료 ${e.code}`) }
+
+    socket.onclose = (e) => {
+      clearInterval(beat.current)
+      log(`WS 종료 ${e.code}${e.reason ? ` ${e.reason}` : ''}${e.wasClean ? '' : ' (비정상)'}`)
+      // 이미 새 연결로 갈아탄 뒤다 — 살아 있는 쪽의 running을 내리면 안 된다
+      if (ws.current !== socket) return
+      if (closing.current || e.code === SUPERSEDED) return setRunning(false)
+      if (retry.current >= MAX_RETRY) {
+        setRunning(false)
+        return log('✗ 재연결 포기')
+      }
+      const wait = RETRY_MS * 2 ** retry.current++
+      log(`재연결 ${retry.current}회차 · ${wait / 1000}초 뒤`)
+      // running은 그대로 둔다 — 좌표 타이머가 살아 있어야 다시 붙었을 때 이어진다
+      setTimeout(connect, wait)
+    }
+
     socket.onerror = () => log('✗ WS — 프록시·토큰 확인')
   }
 
@@ -173,12 +238,15 @@ function Runner({ label }) {
   useEffect(() => {
     if (!running) return
     const timer = setInterval(() => {
-      const speed = 1000 / paceRef.current
       const now = Date.now()
       const locations = Array.from({ length: BATCH_SECONDS }, (_, i) => {
+        // 한 표본이 1초다 — sequence가 그대로 경과 초라 사인파 위상으로 쓴다
+        const t = seq.current++
+        const speed = (1000 / paceRef.current) *
+          (1 + WOBBLE_RATIO * Math.sin((2 * Math.PI * t) / WOBBLE_PERIOD))
         meters.current += speed
         return {
-          sequence: seq.current++,
+          sequence: t,
           latitude: ORIGIN_LAT + meters.current / METERS_PER_DEGREE,
           longitude: ORIGIN_LNG,
           altitudeMeters: 10,
@@ -186,21 +254,23 @@ function Runner({ label }) {
           speedMetersPerSecond: speed,
           headingDegrees: 0,
           cadenceSpm: 170,
-          currentPaceSecondsPerKm: paceRef.current,
+          currentPaceSecondsPerKm: Math.round(1000 / speed),
           recordedAt: localIso(new Date(now - (BATCH_SECONDS - i) * 1000)),
         }
       })
-      ws.current?.send(JSON.stringify({
-        event: 'RUNNING_LOCATION_UPDATE', data: { locations },
-      }))
-      log(`배치 ${Math.round(meters.current)}m`)
+      // 재연결 중이면 이 배치는 버린다. meters는 그대로 올려 둔다 —
+      // 다시 붙었을 때 위도가 건너뛰고, 서버는 점 사이 거리를 더하므로 빠진 만큼이 메워진다
+      const sent = sendWs({ event: 'RUNNING_LOCATION_UPDATE', data: { locations } })
+      log(`배치 ${Math.round(meters.current)}m${sent ? '' : ' — 연결 끊김, 버림'}`)
     }, BATCH_SECONDS * 1000)
     return () => clearInterval(timer)
   }, [running])
 
-  const finish = () => ws.current?.send(JSON.stringify({
-    event: 'RUNNING_FINISH', data: { runningRoomId: Number(roomId), forced: false },
-  }))
+  // 종료는 우리가 부른 것이다 — 뒤따르는 close에 재연결이 붙으면 안 된다
+  const finish = () => {
+    closing.current = true
+    sendWs({ event: 'RUNNING_FINISH', data: { runningRoomId: Number(roomId), forced: false } })
+  }
 
   // ---------- 화면 ----------
   return (
