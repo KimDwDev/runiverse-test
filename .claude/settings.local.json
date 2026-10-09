@@ -20,7 +20,8 @@
       "Bash(cd \"//wsl.localhost/Ubuntu-24.04/home/naxtto/swmaestro/runiverse-backend/running-service/src/main\" && cat java/com/runiverse/running_service/infrastructure/websocket/WebSocketProperties.java; echo \"=== resources ===\"; ls resources; echo \"=== grep websocket config ===\"; grep -rn -A8 -i \"websocket\" resources/*.yml resources/**/*.yml 2>/dev/null | head -40)",
       "Bash(cd \"//wsl.localhost/Ubuntu-24.04/home/naxtto/swmaestro/runiverse-backend/running-service/src/main/resources\" && grep -n -i \"websocket\\\\|idle\\\\|combo\\\\|tick\" application.properties)",
       "Read(///wsl.localhost/Ubuntu-24.04/home/naxtto/swmaestro/runiverse-backend/running-service/src/main/**)",
-      "Bash(cd \"//wsl.localhost/Ubuntu-24.04/home/naxtto/swmaestro/runiverse-backend/running-service/src/main/java\" && grep -rn \"\\\\.close\\(\\\\|CloseStatus\\\\|SESSION_LIMIT\\\\|POLICY_VIOLATION\" --include=*.java . | grep -v \"^.*Test\" | head -30)"
+      "Bash(cd \"//wsl.localhost/Ubuntu-24.04/home/naxtto/swmaestro/runiverse-backend/running-service/src/main/java\" && grep -rn \"\\\\.close\\(\\\\|CloseStatus\\\\|SESSION_LIMIT\\\\|POLICY_VIOLATION\" --include=*.java . | grep -v \"^.*Test\" | head -30)",
+      "Bash(gh pr *)"
     ]
   }
 }
